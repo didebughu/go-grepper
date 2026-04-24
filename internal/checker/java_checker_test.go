@@ -416,3 +416,153 @@ func TestJava_FileLevelIssues_Deserialization(t *testing.T) {
 		t.Errorf("应报告反序列化问题，实际报告: %s", reporter.dumpIssues())
 	}
 }
+
+// ==================== checkSQLiValidation 补充测试 ====================
+
+// 测试变量被 sanitize 后再使用不应误报 JAVA-SQLI-002
+func TestJava_CheckSQLi_SanitizedVariableNotFalsePositive(t *testing.T) {
+	checker := &JavaChecker{}
+	reporter := newMockReporter()
+	tracker := newTracker()
+
+	// 第一步：追踪到 sql 变量
+	checker.checkSQLiValidation(`  String sql = "SELECT * FROM users WHERE id=" + userId;`, "Test.java", 5, tracker, reporter)
+	reporter.Issues = nil
+
+	// 第二步：对 sql 变量进行 sanitize 清理
+	checker.checkSQLiValidation(`  sql = sanitize(sql);`, "Test.java", 6, tracker, reporter)
+
+	// 第三步：使用已清理的 sql 变量执行查询
+	checker.checkSQLiValidation(`  rs = stmt.executeQuery(sql);`, "Test.java", 10, tracker, reporter)
+
+	if len(reporter.Issues) > 0 {
+		t.Errorf("变量被 sanitize 后不应报告 JAVA-SQLI-002，实际报告: %s", reporter.dumpIssues())
+	}
+	if tracker.HasVulnSQLString {
+		t.Errorf("所有 SQL 变量被清理后 HasVulnSQLString 应为 false")
+	}
+}
+
+// 测试变量名子串不应误报（如变量名 "sql" 不应匹配 "resultSql"）
+func TestJava_CheckSQLi_VariableSubstringNoFalsePositive(t *testing.T) {
+	checker := &JavaChecker{}
+	reporter := newMockReporter()
+	tracker := newTracker()
+
+	// 追踪变量名为 "sql"
+	checker.checkSQLiValidation(`  String sql = "SELECT * FROM users WHERE id=" + userId;`, "Test.java", 5, tracker, reporter)
+	reporter.Issues = nil
+
+	// 使用的变量名是 "resultSql"，不应匹配 "sql"
+	checker.checkSQLiValidation(`  rs = stmt.executeQuery(resultSql);`, "Test.java", 10, tracker, reporter)
+
+	if len(reporter.Issues) > 0 {
+		t.Errorf("变量名子串不应触发 JAVA-SQLI-002，实际报告: %s", reporter.dumpIssues())
+	}
+}
+
+// 测试使用 prepareStatement 的 SQLI-001 场景
+func TestJava_CheckSQLi_PrepareStatementDynamic(t *testing.T) {
+	checker := &JavaChecker{}
+	reporter := newMockReporter()
+	tracker := newTracker()
+
+	checker.checkSQLiValidation(`  PreparedStatement ps = conn.prepareStatement("SELECT * FROM users WHERE name='" + name + "'");`, "Test.java", 10, tracker, reporter)
+
+	if !reporter.hasIssueWithTitle("Potential SQL Injection") {
+		t.Errorf("应检测到 prepareStatement 中的动态 SQL 注入，实际报告: %s", reporter.dumpIssues())
+	}
+}
+
+// 测试不含引号或不含 + 的安全调用不应报告
+func TestJava_CheckSQLi_SafeCallNoReport(t *testing.T) {
+	checker := &JavaChecker{}
+	reporter := newMockReporter()
+	tracker := newTracker()
+
+	// 使用参数化查询，不含 " 和 +
+	checker.checkSQLiValidation(`  rs = stmt.executeQuery(preparedSQL);`, "Test.java", 10, tracker, reporter)
+
+	if len(reporter.Issues) > 0 {
+		t.Errorf("安全的参数化调用不应报告 SQL 注入，实际报告: %s", reporter.dumpIssues())
+	}
+}
+
+// 测试 encode 也能触发 sanitize 过滤
+func TestJava_CheckSQLi_EncodeFiltersSQLi(t *testing.T) {
+	checker := &JavaChecker{}
+	reporter := newMockReporter()
+	tracker := newTracker()
+
+	checker.checkSQLiValidation(`  rs = stmt.executeQuery("SELECT * FROM users WHERE id=" + encode(userId));`, "Test.java", 10, tracker, reporter)
+
+	if len(reporter.Issues) > 0 {
+		t.Errorf("使用 encode 后不应报告 SQL 注入，实际报告: %s", reporter.dumpIssues())
+	}
+}
+
+// 测试 validate 也能触发 sanitize 过滤并移除已追踪变量
+func TestJava_CheckSQLi_ValidateRemovesTrackedVar(t *testing.T) {
+	checker := &JavaChecker{}
+	reporter := newMockReporter()
+	tracker := newTracker()
+
+	// 追踪 sql 变量
+	checker.checkSQLiValidation(`  String sql = "SELECT * FROM users WHERE id=" + userId;`, "Test.java", 5, tracker, reporter)
+
+	if len(tracker.SQLStatements) != 1 || tracker.SQLStatements[0] != "sql" {
+		t.Errorf("应追踪到变量 sql，实际: %v", tracker.SQLStatements)
+	}
+
+	// validate 清理 sql 变量
+	checker.checkSQLiValidation(`  sql = validate(sql);`, "Test.java", 6, tracker, reporter)
+
+	if len(tracker.SQLStatements) != 0 {
+		t.Errorf("validate 后应移除 sql 变量，实际: %v", tracker.SQLStatements)
+	}
+}
+
+// 测试多个 SQL 变量中只移除被 sanitize 的那个
+func TestJava_CheckSQLi_SanitizeRemovesOnlyMatchedVar(t *testing.T) {
+	checker := &JavaChecker{}
+	reporter := newMockReporter()
+	tracker := newTracker()
+
+	// 追踪两个变量
+	checker.checkSQLiValidation(`  String sql1 = "SELECT * FROM users WHERE id=" + userId;`, "Test.java", 5, tracker, reporter)
+	checker.checkSQLiValidation(`  String sql2 = "SELECT * FROM orders WHERE id=" + orderId;`, "Test.java", 6, tracker, reporter)
+
+	if len(tracker.SQLStatements) != 2 {
+		t.Errorf("应追踪到 2 个变量，实际: %v", tracker.SQLStatements)
+	}
+
+	// 只清理 sql1
+	checker.checkSQLiValidation(`  sql1 = sanitize(sql1);`, "Test.java", 7, tracker, reporter)
+
+	if len(tracker.SQLStatements) != 1 || tracker.SQLStatements[0] != "sql2" {
+		t.Errorf("应只保留 sql2，实际: %v", tracker.SQLStatements)
+	}
+
+	// HasVulnSQLString 应仍为 true（还有 sql2）
+	if !tracker.HasVulnSQLString {
+		t.Errorf("仍有未清理的 SQL 变量，HasVulnSQLString 应为 true")
+	}
+}
+
+// 测试使用 Spring JdbcTemplate query 方法的 SQLI-002 场景
+func TestJava_CheckSQLi_SpringJdbcTemplateQuery(t *testing.T) {
+	checker := &JavaChecker{}
+	reporter := newMockReporter()
+	tracker := newTracker()
+
+	// 追踪 sql 变量
+	checker.checkSQLiValidation(`  String sql = "SELECT * FROM users WHERE name='" + name + "'";`, "Test.java", 5, tracker, reporter)
+	reporter.Issues = nil
+
+	// 使用 Spring JdbcTemplate 执行
+	checker.checkSQLiValidation(`  List<User> users = jdbcTemplate.query(sql, rowMapper);`, "Test.java", 10, tracker, reporter)
+
+	if !reporter.hasIssueWithTitle("Potential SQL Injection") {
+		t.Errorf("应检测到 Spring JdbcTemplate 中的 SQL 注入，实际报告: %s", reporter.dumpIssues())
+	}
+}

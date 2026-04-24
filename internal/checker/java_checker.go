@@ -24,7 +24,7 @@ var (
 	reJavaServlet = regexp.MustCompile(`(extends\s+HttpServlet|implements\s+Servlet)`)
 
 	// CheckSQLiValidation
-	reJavaSQLExec  = regexp.MustCompile(`\S*\.(prepareStatement|executeQuery|query|queryForObject|queryForList|queryForInt|queryForMap|update|getQueryString|executeQuery|createNativeQuery|createQuery)\s*\(`)
+	reJavaSQLExec  = regexp.MustCompile(`\S*\.(prepareStatement|executeQuery|query|queryForObject|queryForList|queryForInt|queryForMap|update|getQueryString|createNativeQuery|createQuery)\s*\(`)
 	reJavaSanitize = regexp.MustCompile(`(?i)(validate|encode|sanitize|sanitise)`)
 
 	// CheckXSSValidation
@@ -188,6 +188,16 @@ func (c *JavaChecker) checkSQLiValidation(codeLine, fileName string, lineNumber 
 	}
 
 	if reJavaSanitize.MatchString(codeLine) {
+		// 如果当前行包含 sanitize/validate/encode 等清理操作，
+		// 需要从已追踪的 SQL 变量列表中移除被清理的变量（与原 VB 版行为一致）
+		for i := len(tracker.SQLStatements) - 1; i >= 0; i-- {
+			if strings.Contains(codeLine, tracker.SQLStatements[i]) {
+				tracker.SQLStatements = append(tracker.SQLStatements[:i], tracker.SQLStatements[i+1:]...)
+			}
+		}
+		if len(tracker.SQLStatements) == 0 {
+			tracker.HasVulnSQLString = false
+		}
 		return
 	}
 
@@ -198,7 +208,10 @@ func (c *JavaChecker) checkSQLiValidation(codeLine, fileName string, lineNumber 
 				fileName, model.SeverityCritical, codeLine, lineNumber)
 		} else if tracker.HasVulnSQLString {
 			for _, sqlVar := range tracker.SQLStatements {
-				if strings.Contains(codeLine, sqlVar) {
+				// 使用单词边界匹配，避免变量名子串误报
+				// 例如变量名 "sql" 不应匹配 "resultSql" 或注释中的 "sql"
+				reVarMatch := regexp.MustCompile(`\b` + regexp.QuoteMeta(sqlVar) + `\b`)
+				if reVarMatch.MatchString(codeLine) {
 					reporter.ReportIssue("JAVA-SQLI-002", "Potential SQL Injection",
 						"The application appears to allow SQL injection via a pre-prepared dynamic SQL statement.",
 						fileName, model.SeverityCritical, codeLine, lineNumber)
