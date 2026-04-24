@@ -566,3 +566,135 @@ func TestJava_CheckSQLi_SpringJdbcTemplateQuery(t *testing.T) {
 		t.Errorf("应检测到 Spring JdbcTemplate 中的 SQL 注入，实际报告: %s", reporter.dumpIssues())
 	}
 }
+
+// ==================== 优化后新增测试用例 ====================
+
+// 测试 SQL 结构正则匹配：SELECT...FROM...WHERE 中的拼接
+func TestJava_CheckSQLi_SQLStructSelectConcat(t *testing.T) {
+	checker := &JavaChecker{}
+	reporter := newMockReporter()
+	tracker := newTracker()
+
+	checker.checkSQLiValidation(`  String stmt = "SELECT * FROM users WHERE id=" + userId;`, "Test.java", 10, tracker, reporter)
+
+	if !tracker.HasVulnSQLString {
+		t.Errorf("应检测到 SQL 结构中的拼接风险")
+	}
+}
+
+// 测试 SQL 结构正则匹配：UPDATE...SET...WHERE 中的拼接
+func TestJava_CheckSQLi_SQLStructUpdateConcat(t *testing.T) {
+	checker := &JavaChecker{}
+	reporter := newMockReporter()
+	tracker := newTracker()
+
+	checker.checkSQLiValidation(`  String stmt = "UPDATE users SET name='" + name + "' WHERE id=" + id;`, "Test.java", 10, tracker, reporter)
+
+	if !tracker.HasVulnSQLString {
+		t.Errorf("应检测到 UPDATE SQL 结构中的拼接风险")
+	}
+}
+
+// 测试 SQL 结构正则匹配：DELETE...FROM...WHERE 中的拼接
+func TestJava_CheckSQLi_SQLStructDeleteConcat(t *testing.T) {
+	checker := &JavaChecker{}
+	reporter := newMockReporter()
+	tracker := newTracker()
+
+	checker.checkSQLiValidation(`  String stmt = "DELETE FROM users WHERE id=" + userId;`, "Test.java", 10, tracker, reporter)
+
+	if !tracker.HasVulnSQLString {
+		t.Errorf("应检测到 DELETE SQL 结构中的拼接风险")
+	}
+}
+
+// 测试 String.format 拼接 SQL
+func TestJava_CheckSQLi_StringFormatSQL(t *testing.T) {
+	checker := &JavaChecker{}
+	reporter := newMockReporter()
+	tracker := newTracker()
+
+	checker.checkSQLiValidation(`  String hql = String.format("SELECT * FROM users WHERE name='%s'", name);`, "Test.java", 10, tracker, reporter)
+
+	if !tracker.HasVulnSQLString {
+		t.Errorf("应检测到 String.format 拼接 SQL 的风险")
+	}
+}
+
+// 测试 += 拼接 SQL 片段
+func TestJava_CheckSQLi_PlusEqualsConcat(t *testing.T) {
+	checker := &JavaChecker{}
+	reporter := newMockReporter()
+	tracker := newTracker()
+
+	checker.checkSQLiValidation(`  sql += " WHERE id=" + userId;`, "Test.java", 10, tracker, reporter)
+
+	if !tracker.HasVulnSQLString {
+		t.Errorf("应检测到 += 拼接 SQL 片段的风险")
+	}
+}
+
+// 测试注释行不应误报
+func TestJava_CheckSQLi_CommentLineNoFalsePositive(t *testing.T) {
+	checker := &JavaChecker{}
+	reporter := newMockReporter()
+	tracker := newTracker()
+
+	checker.checkSQLiValidation(`  // String sql = "SELECT * FROM users WHERE id=" + userId;`, "Test.java", 10, tracker, reporter)
+
+	if tracker.HasVulnSQLString {
+		t.Errorf("注释行不应标记为风险 SQL 拼接")
+	}
+}
+
+// 测试日志行不应误报
+func TestJava_CheckSQLi_LogLineNoFalsePositive(t *testing.T) {
+	checker := &JavaChecker{}
+	reporter := newMockReporter()
+	tracker := newTracker()
+
+	checker.checkSQLiValidation(`  logger.debug("Executing SQL query: " + sql);`, "Test.java", 10, tracker, reporter)
+
+	if tracker.HasVulnSQLString {
+		t.Errorf("日志行不应标记为风险 SQL 拼接")
+	}
+}
+
+// 测试 HQL/JPQL 变量名也能被检测
+func TestJava_CheckSQLi_HQLVariableName(t *testing.T) {
+	checker := &JavaChecker{}
+	reporter := newMockReporter()
+	tracker := newTracker()
+
+	checker.checkSQLiValidation(`  String hql = "FROM User WHERE name='" + name + "'";`, "Test.java", 10, tracker, reporter)
+
+	if !tracker.HasVulnSQLString {
+		t.Errorf("应检测到 HQL 变量名中的拼接风险")
+	}
+}
+
+// 测试赋值左侧包含 statement 关键字
+func TestJava_CheckSQLi_StatementVarName(t *testing.T) {
+	checker := &JavaChecker{}
+	reporter := newMockReporter()
+	tracker := newTracker()
+
+	checker.checkSQLiValidation(`  String sqlStatement = "SELECT id FROM orders WHERE status='" + status + "'";`, "Test.java", 10, tracker, reporter)
+
+	if !tracker.HasVulnSQLString {
+		t.Errorf("应检测到 statement 变量名中的拼接风险")
+	}
+}
+
+// 测试普通字符串拼接（非 SQL 相关）不应误报
+func TestJava_CheckSQLi_NonSQLStringConcatNoFalsePositive(t *testing.T) {
+	checker := &JavaChecker{}
+	reporter := newMockReporter()
+	tracker := newTracker()
+
+	checker.checkSQLiValidation(`  String msg = "Hello " + userName + "!";`, "Test.java", 10, tracker, reporter)
+
+	if tracker.HasVulnSQLString {
+		t.Errorf("普通字符串拼接不应标记为风险 SQL 拼接")
+	}
+}

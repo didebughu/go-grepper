@@ -8,7 +8,7 @@ import (
 
 var whitespaceRegex = regexp.MustCompile(`\s+`)
 
-// GetVarName 从代码行中提取变量名（对应原 GetVarName）
+// GetVarName 从代码行中提取变量名
 func GetVarName(codeLine string, splitOnEquals bool) string {
 	var varName string
 

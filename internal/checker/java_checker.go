@@ -2,6 +2,7 @@ package checker
 
 import (
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/didebughu/go-grepper/internal/config"
@@ -25,7 +26,18 @@ var (
 
 	// CheckSQLiValidation
 	reJavaSQLExec  = regexp.MustCompile(`\S*\.(prepareStatement|executeQuery|query|queryForObject|queryForList|queryForInt|queryForMap|update|getQueryString|createNativeQuery|createQuery)\s*\(`)
-	reJavaSanitize = regexp.MustCompile(`(?i)(validate|encode|sanitize|sanitise)`)
+	reJavaSanitize = regexp.MustCompile(`(?i)(validate|encode|sanitize)`)
+
+	// SQL 语句结构匹配：检测 SELECT...FROM...WHERE / UPDATE...SET...WHERE / DELETE...FROM...WHERE 中的拼接
+	reJavaSQLStructConcat = regexp.MustCompile(`(?i)(?:select|update|delete|insert)\s+.*(?:from|set|into).*(?:where|values)\s+\w+\s*=[^"']*(?:"|').*(?:\+|%s)`)
+	// 检测 String.format 拼接 SQL
+	reJavaSQLStringFormat = regexp.MustCompile(`(?i)String\.format\s*\(\s*"[^"]*(?:select|update|delete|insert)[^"]*(?:where|values)[^"]*%s`)
+	// 检测 .concat() 拼接
+	reJavaSQLConcat = regexp.MustCompile(`(?i)(?:\.concat\s*\().*(?:select|update|delete|insert)`)
+	// 检测注释行（排除误报）
+	reJavaCommentLine = regexp.MustCompile(`^\s*(?://|/\*|\*)`)
+	// 检测日志行（排除误报）
+	reJavaLogLine = regexp.MustCompile(`(?i)\b(?:log|logger|LOG|LOGGER)\s*\.\s*(?:debug|info|warn|error|trace)\s*\(`)
 
 	// CheckXSSValidation
 	reJavaGetParam    = regexp.MustCompile(`\s*\S*\s*={1}?\s*\S*\s*\brequest\b\.\bgetParameter\b`)
@@ -168,19 +180,61 @@ func (c *JavaChecker) checkSQLiValidation(codeLine, fileName string, lineNumber 
 		return
 	}
 
+	// 排除注释行和日志行，减少误报
+	trimmedLine := strings.TrimSpace(codeLine)
+	if reJavaCommentLine.MatchString(trimmedLine) || reJavaLogLine.MatchString(codeLine) {
+		return
+	}
+
 	lowerLine := strings.ToLower(codeLine)
-	if strings.Contains(codeLine, "=") && (strings.Contains(lowerLine, "sql") || strings.Contains(lowerLine, "query")) &&
-		strings.Contains(codeLine, "\"") && strings.Contains(codeLine, "+") {
+
+	// 检测风险 SQL 拼接字符串并追踪变量
+	// 策略1：正则匹配 SQL 语句结构（SELECT/UPDATE/DELETE/INSERT...WHERE）中的拼接
+	// 策略2：关键字匹配（sql/query/hql/jpql 等变量名 + 字符串拼接特征）
+	isRiskySQLConcat := false
+
+	// 策略1：SQL 结构匹配 —— 直接检测 SQL 语句中 WHERE/VALUES 子句的拼接
+	if reJavaSQLStructConcat.MatchString(codeLine) {
+		isRiskySQLConcat = true
+	}
+
+	// 策略2：String.format 拼接 SQL
+	if !isRiskySQLConcat && reJavaSQLStringFormat.MatchString(codeLine) {
+		isRiskySQLConcat = true
+	}
+
+	// 策略3：.concat() 拼接 SQL
+	if !isRiskySQLConcat && reJavaSQLConcat.MatchString(codeLine) && strings.Contains(codeLine, "\"") {
+		isRiskySQLConcat = true
+	}
+
+	// 策略4：传统关键字匹配（保留兼容性，但增加更严格的约束）
+	// 要求变量名或赋值左侧包含 sql/query/hql/jpql 等关键字
+	if !isRiskySQLConcat && strings.Contains(codeLine, "=") && strings.Contains(codeLine, "\"") && strings.Contains(codeLine, "+") {
+		// 提取赋值左侧部分进行关键字匹配，避免右侧字符串内容干扰
+		eqIdx := strings.Index(codeLine, "=")
+		if eqIdx > 0 {
+			leftPart := strings.ToLower(codeLine[:eqIdx])
+			if strings.Contains(leftPart, "sql") || strings.Contains(leftPart, "query") ||
+				strings.Contains(leftPart, "hql") || strings.Contains(leftPart, "jpql") {
+				isRiskySQLConcat = true
+			}
+		}
+	}
+
+	// 策略5：+= 拼接追加 SQL 片段（如 sql += " WHERE id=" + id）
+	if !isRiskySQLConcat && strings.Contains(codeLine, "+=") && strings.Contains(codeLine, "\"") {
+		if strings.Contains(lowerLine, "where") || strings.Contains(lowerLine, "and ") ||
+			strings.Contains(lowerLine, "or ") || strings.Contains(lowerLine, "set ") {
+			isRiskySQLConcat = true
+		}
+	}
+
+	if isRiskySQLConcat {
 		varName := util.GetVarName(codeLine, false)
 		tracker.HasVulnSQLString = true
 		if regexp.MustCompile(`^[a-zA-Z0-9_]*$`).MatchString(varName) {
-			found := false
-			for _, s := range tracker.SQLStatements {
-				if s == varName {
-					found = true
-					break
-				}
-			}
+			found := slices.Contains(tracker.SQLStatements, varName)
 			if !found {
 				tracker.SQLStatements = append(tracker.SQLStatements, varName)
 			}
@@ -189,7 +243,7 @@ func (c *JavaChecker) checkSQLiValidation(codeLine, fileName string, lineNumber 
 
 	if reJavaSanitize.MatchString(codeLine) {
 		// 如果当前行包含 sanitize/validate/encode 等清理操作，
-		// 需要从已追踪的 SQL 变量列表中移除被清理的变量（与原 VB 版行为一致）
+		// 需要从已追踪的 SQL 变量列表中移除被清理的变量
 		for i := len(tracker.SQLStatements) - 1; i >= 0; i-- {
 			if strings.Contains(codeLine, tracker.SQLStatements[i]) {
 				tracker.SQLStatements = append(tracker.SQLStatements[:i], tracker.SQLStatements[i+1:]...)
@@ -202,6 +256,7 @@ func (c *JavaChecker) checkSQLiValidation(codeLine, fileName string, lineNumber 
 	}
 
 	if reJavaSQLExec.MatchString(codeLine) {
+		// 匹配 " 符号说明语句中有字符串字面量，匹配 + 号匹配拼接
 		if strings.Contains(codeLine, "\"") && strings.Contains(codeLine, "+") {
 			reporter.ReportIssue("JAVA-SQLI-001", "Potential SQL Injection",
 				"The application appears to allow SQL injection via dynamic SQL statements.",
@@ -210,6 +265,7 @@ func (c *JavaChecker) checkSQLiValidation(codeLine, fileName string, lineNumber 
 			for _, sqlVar := range tracker.SQLStatements {
 				// 使用单词边界匹配，避免变量名子串误报
 				// 例如变量名 "sql" 不应匹配 "resultSql" 或注释中的 "sql"
+				// regexp.QuoteMeta 对字符串中所有正则表达式的元字符进行转义，使其在正则表达式中被当作普通字面量字符来匹配。
 				reVarMatch := regexp.MustCompile(`\b` + regexp.QuoteMeta(sqlVar) + `\b`)
 				if reVarMatch.MatchString(codeLine) {
 					reporter.ReportIssue("JAVA-SQLI-002", "Potential SQL Injection",
